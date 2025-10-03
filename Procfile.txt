@@ -1,0 +1,1 @@
+web: uvicorn angel_bridge_min:app --host 0.0.0.0 --port 10000
