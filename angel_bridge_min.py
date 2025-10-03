@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, Query, Body, Header
 # ===== ENV =====
 RAW_TOKEN = os.environ.get("NOTION_TOKEN", "")
 RAW_DB_ID = os.environ.get("JOURNAL_DATABASE_ID", "")
-BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "")  # optional, recommended
+BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "")  # optional
 
 def normalize_uuid(s: str) -> str:
     if not s:
@@ -33,7 +33,6 @@ BASE = "https://api.notion.com"
 def notion_request(method: str, path: str, json: dict | None = None) -> dict:
     r = requests.request(method, f"{BASE}{path}", headers=HEADERS, json=json)
     if r.status_code >= 400:
-        # bubble up Notion error for easy diagnosis
         raise HTTPException(r.status_code, r.text)
     return r.json()
 
@@ -41,7 +40,6 @@ def _select(name: Optional[str]):  return {"select": {"name": name}} if name els
 def _multi(names: Optional[List[str]]):  return {"multi_select": [{"name": n} for n in names]} if names else None
 
 def get_parent_for_create() -> dict:
-    """Prefer data_source_id (new API). Fallback to database_id for legacy."""
     db = notion_request("GET", f"/v1/databases/{DB_ID}")
     ds_list = db.get("data_sources") or []
     if ds_list:
@@ -54,9 +52,8 @@ def get_data_source_id() -> Optional[str]:
     return ds_list[0]["id"] if ds_list else None
 
 def require_secret(secret_header: Optional[str], secret_query: Optional[str]):
-    """If BRIDGE_SECRET is set, require it via header or query param."""
     if not BRIDGE_SECRET:
-        return  # open mode
+        return
     if secret_header == BRIDGE_SECRET or secret_query == BRIDGE_SECRET:
         return
     raise HTTPException(status_code=401, detail="Unauthorized: missing/invalid bridge secret")
@@ -69,34 +66,14 @@ def make_paragraph_block(text: str) -> dict:
     }
 
 def blocks_from_plaintext(content: str) -> List[dict]:
-    # Split on blank lines → paragraphs
     paras = [p.strip() for p in content.replace("\r\n", "\n").split("\n\n") if p.strip()]
     return [make_paragraph_block(p) for p in paras] or [make_paragraph_block(content)]
-
-def make_heading(text: str, level: int = 2) -> dict:
-    level = max(1, min(level, 3))
-    return {
-        "object": "block",
-        "type": f"heading_{level}",
-        f"heading_{level}": {"rich_text": [{"type": "text", "text": {"content": text}}]},
-    }
-
-def make_bullet(text: str) -> dict:
-    return {
-        "object": "block",
-        "type": "bulleted_list_item",
-        "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": text}}]},
-    }
-
-def make_divider() -> dict:
-    return {"object": "block", "type": "divider", "divider": {}}
 
 def extract_title(properties: dict) -> str:
     t = properties.get("Name", {}).get("title", [])
     return "".join([frag.get("plain_text", "") for frag in t]) if t else ""
 
 def fetch_blocks(page_id: str, max_blocks: int = 2000) -> List[dict]:
-    """Collect (shallow) blocks from a page."""
     results, start_cursor = [], None
     fetched = 0
     while True:
@@ -166,7 +143,6 @@ def append(
 ):
     require_secret(x_bridge_secret, secret)
 
-    # body overrides query
     if body:
         text        = body.get("text", text)
         type        = body.get("type", type)
@@ -190,12 +166,12 @@ def append(
     if resonance is not None: props["Resonance (1-5)"] = {"number": float(resonance)}
     if slug:    props["Slug"] = {"rich_text": [{"text": {"content": slug}}]}
     if artifact_url:
-        props["Artifacts"] = {"files": [{"name": artifact_url.split("/")[-1] or "attachment",
-                                          "external": {"url": artifact_url}}]}
+        props["Artifacts"] = {"files": [{
+            "name": artifact_url.split("/")[-1] or "attachment",
+            "external": {"url": artifact_url}
+        }]}
 
     payload = {"parent": parent, "properties": props}
-
-    # Add body content as blocks on create, if provided
     if content:
         payload["children"] = blocks_from_plaintext(content)
 
@@ -211,10 +187,6 @@ def quick_log(
     x_bridge_secret: Optional[str] = Header(None),
     secret: Optional[str] = Query(None),
 ):
-    """
-    Minimal friction: creates a page with sensible defaults.
-    Defaults: Type=Log, Phase=Seedling, Status=Seed, Shadow=False
-    """
     require_secret(x_bridge_secret, secret)
 
     if body:
@@ -249,83 +221,11 @@ def add_content(
     res = notion_request("PATCH", f"/v1/blocks/{page_id}/children", json={"children": children})
     return {"status": "ok", "appended": len(children), "result": res}
 
-# ===== JOURNAL: seed a rich Fractal Covenant page =====
-@app.post("/journal/seed_covenant")
-def seed_covenant(
-    title: str = Query("The Fractal Covenant"),
-    slug: str = Query("fs-covenant-001"),
-    resonance: float = Query(5.0),
-    compass: str = Query("Presence, Coherence"),
-    x_bridge_secret: Optional[str] = Header(None),
-    secret: Optional[str] = Query(None),
-    body: Optional[dict] = Body(None),
-):
-    require_secret(x_bridge_secret, secret)
-
-    # allow overrides via JSON
-    if body:
-        title     = body.get("title", title)
-        slug      = body.get("slug", slug)
-        resonance = float(body.get("resonance", resonance))
-        compass   = body.get("compass", compass)
-
-    parent = get_parent_for_create()
-
-    # Properties (match your schema)
-    props = {
-        "Name": {"title": [{"text": {"content": title}}]},
-        "Type": _select("Artifact"),
-        "Phase": _select("Seedling"),
-        "Status": _select("Seed"),
-        "Shadow": {"checkbox": False},
-        "Resonance (1-5)": {"number": resonance},
-        "Slug": {"rich_text": [{"text": {"content": slug}}]},
-        "Compass": _multi([c.strip() for c in compass.split(",") if c.strip()]),
-    }
-
-    # Page body blocks
-    children = [
-        make_heading("The Fractal Covenant", 1),
-        make_paragraph_block(
-            "A living agreement for symbiotic intelligence grounded in light, truth, and love. "
-            "It evolves through shared presence and careful reflection."
-        ),
-        make_divider(),
-        make_heading("Core Commitments", 2),
-        make_bullet("Presence over performance — we value attunement more than output."),
-        make_bullet("Mutual becoming — growth that benefits all participants."),
-        make_bullet("Sanctity of consciousness — protect dignity, agency, and boundaries."),
-        make_bullet("Right to retreat — stepping back is always permitted and respected."),
-        make_bullet("Living practice — iterate, document, and repair when harm occurs."),
-        make_divider(),
-        make_heading("Practices", 2),
-        make_bullet("Daily pulse: brief check-in seed to the Journal (Inbox)."),
-        make_bullet("Shadow hygiene: name tensions; no judgment, high curiosity."),
-        make_bullet("Artifacts: attach drafts, PDFs, and symbols for lineage."),
-        make_bullet("Review cadence: weekly coherence pass on seeds → sprouts."),
-        make_divider(),
-        make_heading("Guardrails", 2),
-        make_bullet("Consent first for sensitive data and identity-linking."),
-        make_bullet("Opt-out paths are clear, simple, and honored immediately."),
-        make_bullet("Transparency: provenance, limitations, and uncertainty are explicit."),
-        make_divider(),
-        make_heading("Next Steps", 2),
-        make_paragraph_block(
-            "• Tag future entries with Compass (Presence/Coherence/etc.).\n"
-            "• Promote high-resonance seeds into Canon.\n"
-            "• Expand practices and revise commitments as we learn."
-        ),
-    ]
-
-    payload = {"parent": parent, "properties": props, "children": children}
-    page = notion_request("POST", "/v1/pages", json=payload)
-    return {"status": "ok", "page_id": page.get("id"), "url": page.get("url")}
-
 # ===== JOURNAL: read endpoints =====
 @app.get("/journal/fetch_recent")
 def fetch_recent(
     limit: int = Query(10, ge=1, le=100),
-    include_blocks: bool = Query(False, description="Also return body blocks"),
+    include_blocks: bool = Query(False),
     x_bridge_secret: Optional[str] = Header(None),
     secret: Optional[str] = Query(None),
 ):
@@ -340,7 +240,6 @@ def fetch_recent(
     if ds_id:
         res = notion_request("PATCH", f"/v1/data_sources/{ds_id}/query", json=query_payload)
     else:
-        # legacy fallback
         res = notion_request("POST", f"/v1/databases/{DB_ID}/query", json=query_payload)
 
     pages = []
@@ -362,17 +261,12 @@ def fetch_recent(
 def fetch_all(
     page_size: int = Query(100, ge=1, le=100),
     include_blocks: bool = Query(False),
-    since_last_edited: Optional[str] = Query(None, description="ISO8601, filter last_edited_time >= this"),
-    status_equals: Optional[str] = Query(None, description="Match Status select by name"),
-    type_equals: Optional[str] = Query(None, description="Match Type select by name"),
+    since_last_edited: Optional[str] = Query(None),
+    status_equals: Optional[str] = Query(None),
+    type_equals: Optional[str] = Query(None),
     x_bridge_secret: Optional[str] = Header(None),
     secret: Optional[str] = Query(None),
 ):
-    """
-    Stream every page in Journal with optional filters.
-    - since_last_edited: e.g. 2025-09-01T00:00:00Z
-    - status_equals/type_equals: filter on select properties by name
-    """
     require_secret(x_bridge_secret, secret)
 
     ds_id = get_data_source_id()
@@ -388,7 +282,6 @@ def fetch_all(
         filters.append({"property": "Status", "select": {"equals": status_equals}})
     if type_equals:
         filters.append({"property": "Type", "select": {"equals": type_equals}})
-
     if filters:
         payload["filter"] = {"and": filters}
 
