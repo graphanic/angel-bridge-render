@@ -12,10 +12,9 @@ def normalize_uuid(s: str) -> str:
     """Return hyphenated UUID (8-4-4-4-12) from compact or hyphenated input."""
     if not s:
         return s
-    t = s.strip().lower()
-    t = t.replace("-", "")
+    t = s.strip().lower().replace("-", "")
     if not re.fullmatch(r"[0-9a-f]{32}", t or ""):
-        return s  # leave as-is; we'll let Notion complain
+        return s  # leave as-is; let Notion complain
     return f"{t[0:8]}-{t[8:12]}-{t[12:16]}-{t[16:20]}-{t[20:32]}"
 
 TOKEN = RAW_TOKEN.strip()
@@ -27,7 +26,7 @@ app = FastAPI(title="Angel Bridge (Render)")
 # ----- constants
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
-    "Notion-Version": "2025-09-03",
+    "Notion-Version": "2022-06-28",   # stable Notion API version
     "Content-Type": "application/json",
 }
 BASE = "https://api.notion.com"
@@ -36,7 +35,6 @@ BASE = "https://api.notion.com"
 def notion_request(method: str, path: str, json: dict | None = None) -> dict:
     r = requests.request(method, f"{BASE}{path}", headers=HEADERS, json=json)
     if r.status_code >= 400:
-        # bubble up Notion's error body for easy debugging
         raise HTTPException(r.status_code, r.text)
     return r.json()
 
@@ -46,7 +44,7 @@ def _select(name: Optional[str]):
 def _multi(names: Optional[List[str]]):
     return {"multi_select": [{"name": n} for n in names]} if names else None
 
-# ----- debug routes (harmless, no secrets leaked)
+# ----- debug routes (safe)
 @app.get("/debug/env")
 def debug_env():
     return {
@@ -55,7 +53,7 @@ def debug_env():
         "token_tail": TOKEN[-4:] if TOKEN else None,
         "db_present": bool(DB_ID),
         "db_len": len(DB_ID),
-        "db_value": DB_ID,  # hyphenated form after normalization
+        "db_value": DB_ID,
     }
 
 @app.get("/probe/db")
@@ -69,11 +67,12 @@ def probe_db():
         "data_sources": db.get("data_sources", []),
     }
 
-# ----- main routes
+# ----- health
 @app.get("/health")
 def health():
     return {"ok": True}
 
+# ----- main journal append
 @app.api_route("/journal/append", methods=["GET", "POST"])
 def append(
     text: str = Query(..., description="Title for the new journal entry"),
@@ -83,10 +82,11 @@ def append(
     shadow: Optional[bool] = Query(None),
     resonance: Optional[float] = Query(None),
     status: Optional[str] = Query(None),
-    tags: Optional[str] = Query(None, description="Comma-separated"),
+    slug: Optional[str] = Query(None),
     artifact_url: Optional[str] = Query(None),
     body: Optional[dict] = Body(None),
 ):
+    # body overrides query
     if body:
         text        = body.get("text", text)
         type        = body.get("type", type)
@@ -95,33 +95,35 @@ def append(
         shadow      = body.get("shadow", shadow)
         resonance   = body.get("resonance", resonance)
         status      = body.get("status", status)
-        tags        = body.get("tags", tags)
+        slug        = body.get("slug", slug)
         artifact_url= body.get("artifact_url", artifact_url)
 
-    # Discover the first data_source under this database
+    # Get DB + data source
     db   = notion_request("GET", f"/v1/databases/{DB_ID}")
     ds_id = db["data_sources"][0]["id"]
 
+    # Properties — match your Notion table
     props = {"Name": {"title": [{"text": {"content": text}}]}}
     if type:    props["Type"]    = _select(type)
     if phase:   props["Phase"]   = _select(phase)
     if status:  props["Status"]  = _select(status)
     if compass: props["Compass"] = _multi([c.strip() for c in compass.split(",") if c.strip()])
-    if tags:    props["Tags"]    = _multi([t.strip() for t in tags.split(",") if t.strip()])
-    if shadow is not None:    props["Shadow"]    = {"checkbox": bool(shadow)}
-    if resonance is not None: props["Resonance"] = {"number": float(resonance)}
+    if shadow is not None: props["Shadow"] = {"checkbox": bool(shadow)}
+    if resonance is not None: props["Resonance (1-5)"] = {"number": float(resonance)}
+    if slug:    props["Slug"]    = {"rich_text": [{"text": {"content": slug}}]}
 
-    payload = {
-        "parent": {"type": "data_source_id", "data_source_id": ds_id},
-        "properties": props,
-    }
     if artifact_url:
-        payload["properties"]["Artifacts"] = {
+        props["Artifacts"] = {
             "files": [{
                 "name": artifact_url.split("/")[-1] or "attachment",
                 "external": {"url": artifact_url}
             }]
         }
 
+    payload = {
+        "parent": {"type": "data_source_id", "data_source_id": ds_id},
+        "properties": props,
+    }
+
     page = notion_request("POST", "/v1/pages", json=payload)
-    return {"ok": True, "page_id": page["id"], "title": text}
+    return {"status": "ok", "page_id": page.get("id"), "url": page.get("url")}
